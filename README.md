@@ -9,4 +9,4 @@ Warrant is the product described in `docs/WARRANT_PRD.md`: a merchant-verificati
 
 ## Current state
 
-The repository currently contains only the PRD and documentation scaffold. Implementation details, architecture, and stack choices are intentionally not decided yet.
+The repository currently contains only the PRD and documentation scaffold. The PRD includes a proposed stack and build shape; treat it as the current reference, while still allowing future project decisions to change implementation details if needed.
