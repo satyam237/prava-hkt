@@ -6,10 +6,19 @@ while building `backend/app/services/prava_client.py`. Where the two disagree,
 
 Base URL `https://sandbox.api.prava.space` · auth `Authorization: Bearer <PRAVA_SECRET_KEY>`.
 
-Status of this document: steps 1–4 (through session creation) are verified
-against the live sandbox. Steps 5–8 (post-approval: active mandate, charge,
-reconciliation, over-cap decline) require a human passkey approval and are
-marked **unverified** below until that run completes.
+Status of this document, as of 2026-08-01:
+
+- **Verified against the live sandbox:** steps 1–4 — health, session creation,
+  the error envelope, and one real *failed* approval (§3.1).
+- **NOT VERIFIED:** steps 5–8 — an `active` mandate, a successful charge,
+  returned credentials, reconciliation totals, and the over-cap decline.
+  **No mandate has ever reached `active` and no credential has ever been
+  issued.** The one live approval attempt failed at passkey registration with
+  `PASSKEY_REG_FAILED` (§3.1), so everything downstream of approval is still
+  built from the docs alone and should be treated as unconfirmed.
+
+Nothing in §5 has been observed. Do not read this document as evidence that the
+end-to-end flow works — it currently documents where it stops.
 
 ---
 
@@ -198,9 +207,19 @@ after 15 minutes.
 
 ## 5. Post-approval flow — UNVERIFIED
 
+**Nothing in this section has been observed.** It lists what the docs claim and
+what still needs confirming — not findings.
+
 Blocked on a human passkey approval (Touch ID in the hosted iframe), which no
-script can perform. Once that lands, `python scripts/prava_smoke.py resume`
-exercises and this section should record:
+script can perform. One attempt was made and **failed** at passkey registration
+(§3.1), so no mandate has reached `active` and no credential has been issued.
+The client's post-approval methods (`get_mandate`, `charge_mandate`,
+`report_status`) are therefore exercised only against mocked responses in
+`tests/test_prava_client.py`, built from the documented shapes — which §2 and
+§3 have already shown can differ from the live API. Expect surprises here.
+
+Once an approval lands, `python scripts/prava_smoke.py resume` exercises the
+rest, and this section should record:
 
 - [ ] `GET /v1/mandates/{id}` → does `status` actually pass through `pending` → `active`?
 - [ ] Are `approvedAmount` / `spent` decimal **strings** as documented, or numbers?
