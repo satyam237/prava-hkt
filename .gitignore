@@ -16,3 +16,7 @@ venv/
 
 # Node
 node_modules/
+
+# Live smoke-test scratch state (may reference real sandbox ids)
+.prava_smoke_state.json
+pytest-of-*/

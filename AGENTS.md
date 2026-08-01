@@ -32,6 +32,16 @@ uv venv --python 3.11 .venv && uv pip install --python .venv/bin/python -e ".[de
 
 Dependencies are deliberately minimal and listed in `pyproject.toml`; ask before adding one. `python-whois` is specifically ruled out (PRD §7.2) — use RDAP over `httpx`.
 
+## Prava
+
+Every Prava API call goes through `PravaClient` in `backend/app/services/prava_client.py` — do not call the API directly from a probe, a route, or a script. It normalizes money, applies timeouts, redacts credentials, and maps Prava's error codes to named exceptions so reconciliation can tell `THRESHOLD_EXCEEDED` from `MANDATE_MERCHANT_NOT_ALLOWED`.
+
+`docs/PRAVA_NOTES.md` records where the live sandbox disagrees with Prava's published docs, and is authoritative over them. Read it before writing Prava code — several findings are not guessable, notably that the session response returns **no** `mandate_id` (the mandate is minted at passkey approval, so the id must be read back from `/payment-result`) and that errors nest under `error {code, message}` rather than the documented flat `errorCode`.
+
+`scripts/prava_smoke.py create|resume` is the live flow. It splits in two because the middle needs a human passkey approval; sessions expire 15 minutes after creation, so create the session only when someone is ready to approve.
+
+Sandbox keys live in `.env` (gitignored, never committed). Show at most the first 8 characters of a key in any output.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
