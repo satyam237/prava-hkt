@@ -1,5 +1,7 @@
 # Warrant — PRD & Build Spec v1.0
 
+> **Verification note:** Several assumptions in this PRD were checked after it was written; some were confirmed and some were refuted. Read `docs/VERIFICATION.md` first, and treat it as overriding this PRD wherever they conflict.
+
 **Working name:** Warrant. A warrant is both a legal authorization to act and a guarantee that something is true. That is exactly the product: the agent cannot spend until it can prove where it is spending.
 
 Alternatives if you dislike it: Bonafide, Clearance, Provenance, Attest.
