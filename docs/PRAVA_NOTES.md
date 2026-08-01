@@ -128,6 +128,61 @@ string.
 
 ---
 
+## 3.1 Observed failure: `PASSKEY_REG_FAILED` (undocumented code)
+
+A real approval attempt failed at passkey registration on the card-network
+page, *after* a valid OTP. `GET /v1/sessions/{id}/payment-result` returned
+verbatim (credentials redacted, all `<none>`):
+
+```json
+{
+  "session_id": "ses_01KYZDJEFW1AVK6C6NMR4FCP93",
+  "order_id":   "ord_01KYZDJEFW1AVK6C6NMR4FCP94",
+  "status": "failed",
+  "transactions": [{
+    "txn_id": "txn_01KYZDMKJMAB0BSZ63ST4STZ34",
+    "status": "failed",
+    "error": { "code": "PASSKEY_REG_FAILED", "message": "Request failed with status code 400" },
+    "line_items": [{
+      "txn_ref_id": "tli_01KYZDMKJS2CJKPE5WB87PRN6S",
+      "merchant_name": "Northstar Supply",
+      "merchant_url": "https://breach.localhost",
+      "total_amount": "84.00",
+      "status": "pending",
+      "token": null, "dynamic_cvv": null, "expiry_month": null, "expiry_year": null,
+      "products": []
+    }]
+  }]
+}
+```
+
+Four things worth knowing from this:
+
+1. **`PASSKEY_REG_FAILED` is not in the documented error-code list**, and its
+   message is a passed-through upstream string (`"Request failed with status
+   code 400"`) rather than anything actionable. Do not expect the documented
+   codes to be exhaustive; the client keeps unknown codes verbatim as a plain
+   `PravaError` rather than forcing them into a known category.
+2. **The error lives on the transaction, not at the top level.** The response
+   root has no `error` key at all — a reader that only checks a top-level
+   `error` sees `status: "failed"` with no reason. Walk `transactions[].error`,
+   and note the docs describe `error` only as a sibling of `status`.
+3. **`status` disagrees between levels**: the transaction is `failed` while its
+   line item is still `pending`. Trust the transaction status; the line item's
+   is not updated on this path.
+4. **`products: []` comes back empty** even though the session was created with
+   one product in `purchase_context`. The product detail is not echoed on a
+   failed transaction, so do not rely on `products[]` to recover what was
+   ordered — keep your own copy.
+
+**No mandate is created on this path.** There is no `mandate_id` anywhere in the
+response, consistent with §2.1 (the mandate is minted at *successful* approval).
+So there is nothing to poll at `GET /v1/mandates/{id}` after a failed approval —
+the failure is only visible via the session.
+
+The session is terminal at this point: `status: "failed"` and the checkout link
+is already consumed (§2.4). Recovery is a brand-new session, not a retry.
+
 ## 4. `revoke_session` — no such endpoint
 
 No session-revocation endpoint is documented, and none was found. The client's
