@@ -27,7 +27,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer
 
 WARRANT_VERSION = "warrant/1"
 WARRANT_ID_PREFIX = "wrt_"
@@ -137,17 +137,24 @@ def _normalize_utc(value: Any) -> Any:
     return value
 
 
+def rfc3339z(value: datetime) -> str:
+    """Render a UTC datetime as ``YYYY-MM-DDTHH:MM:SSZ``."""
+    return _normalize_utc(value).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 MoneyStr = Annotated[str, BeforeValidator(_coerce_money)]
 ScoreStr = Annotated[str, BeforeValidator(_coerce_score)]
 CurrencyStr = Annotated[str, BeforeValidator(_coerce_currency)]
 ContentHash = Annotated[str, BeforeValidator(_coerce_content_hash)]
 SignalValue = Annotated[Union[bool, int, str, None], BeforeValidator(_coerce_signal_value)]
-UtcDatetime = Annotated[datetime, BeforeValidator(_normalize_utc)]
-
-
-def rfc3339z(value: datetime) -> str:
-    """Render a UTC datetime as ``YYYY-MM-DDTHH:MM:SSZ``."""
-    return _normalize_utc(value).strftime("%Y-%m-%dT%H:%M:%SZ")
+#: Carries its own JSON serializer, so any field declared ``UtcDatetime`` is
+#: canonical by construction. Pydantic's default rendering would emit
+#: "+00:00" and microseconds, which is a different set of signed bytes.
+UtcDatetime = Annotated[
+    datetime,
+    BeforeValidator(_normalize_utc),
+    PlainSerializer(rfc3339z, return_type=str, when_used="json"),
+]
 
 
 def utcnow() -> datetime:
@@ -247,10 +254,6 @@ class Authorization(StrictModel):
     single_use: bool = True
     expected_fulfillment_by: UtcDatetime | None = None
 
-    @field_serializer("expected_fulfillment_by")
-    def _serialize_expected_fulfillment_by(self, value: datetime | None) -> str | None:
-        return None if value is None else rfc3339z(value)
-
 
 class Warrant(StrictModel):
     """The signed document.
@@ -266,10 +269,6 @@ class Warrant(StrictModel):
     authorization: Authorization
     issued_at: UtcDatetime = Field(default_factory=utcnow)
     signature: str | None = None
-
-    @field_serializer("issued_at")
-    def _serialize_issued_at(self, value: datetime) -> str:
-        return rfc3339z(value)
 
 
 # ---------------------------------------------------------------------------
@@ -296,10 +295,6 @@ class Outcome(StrictModel):
     source: str | None = None
     observed_at: UtcDatetime = Field(default_factory=utcnow)
 
-    @field_serializer("observed_at")
-    def _serialize_observed_at(self, value: datetime) -> str:
-        return rfc3339z(value)
-
 
 class Breach(StrictModel):
     """One way the outcome departed from the warrant.
@@ -319,10 +314,6 @@ class Reconciliation(StrictModel):
     status: ReconciliationStatus
     breaches: list[Breach] = Field(default_factory=list)
     reconciled_at: UtcDatetime = Field(default_factory=utcnow)
-
-    @field_serializer("reconciled_at")
-    def _serialize_reconciled_at(self, value: datetime) -> str:
-        return rfc3339z(value)
 
 
 __all__ = [

@@ -223,20 +223,23 @@ def verify_warrant(
     """Return True iff the document's signature matches its canonical bytes.
 
     Returns False rather than raising for every failure mode a hostile document
-    can cause — missing, malformed, or wrong signature — so callers can treat this
-    as a plain predicate.
+    can cause — not a document at all, missing, malformed, or wrong signature, or
+    values that cannot be canonicalized (``json.loads`` accepts ``NaN`` and
+    ``Infinity``, which ``canonical_bytes`` refuses) — so callers can treat this
+    as a plain predicate over untrusted input.
     """
     key = public_key if public_key is not None else load_public_key()
-    document = to_document(warrant)
-    signature = document.get("signature")
-    if not signature:
-        return False
     try:
+        document = to_document(warrant)
+        signature = document.get("signature")
+        if not signature:
+            return False
         raw_signature = decode_signature(signature)
-    except ValueError:
+        message = canonical_bytes(document)
+    except (TypeError, ValueError):
         return False
     try:
-        key.verify(raw_signature, canonical_bytes(document))
+        key.verify(raw_signature, message)
     except InvalidSignature:
         return False
     return True

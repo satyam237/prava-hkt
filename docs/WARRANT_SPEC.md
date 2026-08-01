@@ -13,7 +13,7 @@ This document is written so that someone with only this file, a WARRANT JSON doc
 
 ## 1. Document structure
 
-A WARRANT is a JSON object with exactly nine top-level keys. No key is optional, and no additional key is permitted; a value that is not known is JSON `null`, never absent.
+A WARRANT is a JSON object with exactly seven top-level keys. No key is optional, and no additional key is permitted; a value that is not known is JSON `null`, never absent.
 
 | Field | Type | Notes |
 |---|---|---|

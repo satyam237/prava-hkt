@@ -82,29 +82,54 @@ def _get(document: dict[str, Any], *path: str, default: str = "-") -> Any:
     return default if node is None else node
 
 
-def describe(document: dict[str, Any], key_path: Path) -> str:
-    """Human-readable summary of what this warrant actually authorizes."""
-    domain = _get(document, "merchant", "domain")
-    name = _get(document, "merchant", "resolved_name", default="")
-    merchant = f"{domain} ({name})" if name else str(domain)
+def _clean(value: Any, limit: int | None = 120) -> str:
+    """Render an untrusted value as a single safe line of terminal output.
 
-    verdict = _get(document, "verification", "verdict")
-    score = _get(document, "verification", "score")
-    quantity = _get(document, "authorization", "quantity")
-    amount = _get(document, "authorization", "amount")
-    currency = _get(document, "authorization", "currency")
+    Everything printed below the WARRANT header comes from a document whose
+    signature has not been checked yet. Left raw, a crafted string could use
+    newlines to print its own "VALID" line, or ANSI escapes to erase the real
+    verdict — the summary this tool exists to produce would then be a forgery.
+    C0/C1 controls and DEL are escaped, not emitted, and long values are capped.
+    A legitimate document contains none of these and renders unchanged.
+    """
+    text = value if isinstance(value, str) else str(value)
+    safe = "".join(
+        f"\\x{ord(ch):02x}"
+        if ord(ch) < 0x20 or ord(ch) == 0x7F or 0x80 <= ord(ch) <= 0x9F
+        else ch
+        for ch in text
+    )
+    if limit is not None and len(safe) > limit:
+        safe = safe[:limit] + "..."
+    return safe
+
+
+def describe(document: dict[str, Any], key_path: Path) -> str:
+    """Human-readable summary of what this warrant actually authorizes.
+
+    Nothing here is trustworthy yet — the signature is checked after this prints.
+    """
+    domain = _clean(_get(document, "merchant", "domain"), limit=80)
+    name = _clean(_get(document, "merchant", "resolved_name", default=""), limit=80)
+    merchant = f"{domain} ({name})" if name else domain
+
+    verdict = _clean(_get(document, "verification", "verdict"), limit=16)
+    score = _clean(_get(document, "verification", "score"), limit=16)
+    quantity = _clean(_get(document, "authorization", "quantity"), limit=16)
+    amount = _clean(_get(document, "authorization", "amount"), limit=32)
+    currency = _clean(_get(document, "authorization", "currency"), limit=16)
     single_use = _get(document, "authorization", "single_use")
-    description = _get(document, "authorization", "description", default="")
+    description = _clean(_get(document, "authorization", "description", default=""))
 
     lines = [
-        f"  warrant     {_get(document, 'warrant_id')}",
-        f"  version     {_get(document, 'version')}",
+        f"  warrant     {_clean(_get(document, 'warrant_id'), limit=80)}",
+        f"  version     {_clean(_get(document, 'version'), limit=40)}",
         f"  merchant    {merchant}",
         f"  verdict     {verdict}  (score {score})",
         f"  amount      {amount} {currency}",
         f"  authorizes  {quantity} x {description}".rstrip(),
-        f"  single use  {'yes' if single_use is True else 'no' if single_use is False else single_use}",
-        f"  issued at   {_get(document, 'issued_at')}",
+        f"  single use  {'yes' if single_use is True else 'no' if single_use is False else _clean(single_use, limit=16)}",
+        f"  issued at   {_clean(_get(document, 'issued_at'), limit=40)}",
         f"  public key  {key_path}",
     ]
     return "\n".join(lines)
@@ -155,14 +180,19 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"error: bad public key {key_path}: {exc}\n")
         return 2
 
-    message = canonical_bytes(document)
+    try:
+        message = canonical_bytes(document)
+    except (ValueError, TypeError) as exc:
+        # json.loads accepts NaN and Infinity; canonical serialization does not.
+        sys.stderr.write(f"error: {args.warrant} cannot be canonicalized: {exc}\n")
+        return 2
 
     print("WARRANT")
     print(describe(document, key_path))
     if args.show_canonical:
         print(RULE)
         print("  signed bytes:")
-        print(f"  {message.decode('utf-8')}")
+        print(f"  {_clean(message.decode('utf-8'), limit=None)}")
     print(RULE)
 
     try:

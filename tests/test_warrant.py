@@ -248,7 +248,8 @@ def test_non_ascii_is_not_escaped():
     """ensure_ascii=False — the merchant name is emitted as UTF-8, not \\uXXXX."""
     raw = canonical_bytes(build_warrant(merchant={"domain": "café.example", "resolved_name": "Café Ridge"}))
     assert "Café Ridge".encode("utf-8") in raw
-    assert rb"\\u00e9" not in raw, "non-ASCII must not be \\uXXXX-escaped"
+    escaped = json.dumps("Café Ridge", ensure_ascii=True).encode("ascii")
+    assert escaped not in raw, f"non-ASCII must not be escaped as {escaped!r}"
 
 
 def test_canonical_bytes_identical_for_model_and_mapping(warrant):
