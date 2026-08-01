@@ -161,7 +161,9 @@ async def phase_create() -> int:
         print(
             "\n  A person must now open the iframe_url above, enter a sandbox\n"
             "  test card and OTP, and approve with a real passkey (Touch ID).\n"
-            "  Sessions expire 15 minutes after creation.\n\n"
+            "\n  !! The link is SINGLE-USE and expires in 15 minutes. Do not open\n"
+            "     it to check that it works — one load consumes it and the next\n"
+            "     shows 'Session Already Used'. Only the approver opens it.\n\n"
             "  Then run:  python scripts/prava_smoke.py resume\n"
         )
         return 0

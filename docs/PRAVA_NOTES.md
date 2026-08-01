@@ -81,7 +81,26 @@ smoke state file on the first run. `redact()` now matches any field name
 containing `token` / `secret` / `cvv` / `password` / `credential`, and
 `tests/test_prava_client.py` pins the regression. Prefer over-redacting.
 
-### 2.4 `expires_at` is returned explicitly
+### 2.4 `iframe_url` is SINGLE-USE — do not open it to "check" it
+
+Learned by breaking one. Loading the checkout URL once consumes it; a second
+load renders:
+
+> **Session Already Used** — This session link has already been used. It may be
+> active in another tab. Please request a new session link.
+
+There is no way to reopen or reset it. Practical consequences:
+
+- **Never open the URL programmatically**, not even to screenshot it, snapshot
+  the DOM, or verify it resolves. An agent that "checks the link works" has
+  destroyed it. This burned a session during this build.
+- Hand the URL to the human **unopened**, and mint it only when they are
+  actually at the keyboard — the 15-minute expiry plus single-use means a link
+  generated in advance is usually already worthless.
+- A failed or abandoned approval is not recoverable on the same link. Mint a
+  fresh session.
+
+### 2.5 `expires_at` is returned explicitly
 
 15 minutes after creation, matching the documented session TTL. Use the
 returned value rather than computing it locally.
@@ -141,10 +160,14 @@ exercises and this section should record:
 
 ## Practical notes for later blocks
 
-- **Sessions expire in 15 minutes**, and approval needs a human at a keyboard.
-  Create the session immediately before the person is ready to approve, not
-  ahead of time. A demo that creates the session early will show an expired
-  page.
+- **Sessions expire in 15 minutes and the checkout link is single-use** (§2.4),
+  and approval needs a human at a keyboard. Create the session immediately
+  before the person is ready to approve, never ahead of time and never to test
+  that it works. A demo that creates the session early shows an expired page;
+  an agent that opens the link to verify it shows "Session Already Used".
+- **The sandbox test card and OTP are not published** anywhere reachable from
+  this repo or `docs.prava.space`. They have to come from whoever provisioned
+  the sandbox account. Do not guess card numbers against the live sandbox.
 - **Case conventions differ by endpoint family.** Session endpoints return
   `snake_case` (`session_id`, `iframe_url`, `expires_at`); mandate endpoints are
   documented as `camelCase` (`approvedAmount`, `chargeCount`, `transactionId`).
