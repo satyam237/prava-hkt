@@ -45,8 +45,8 @@
       <div class="spec">
         <div><span>Agent authorization</span><strong>1 unit</strong></div>
         <div><span>Amount cap</span><strong>$84.00</strong></div>
-        <div><span>Configured confirmation quantity</span><strong>{{ breach_quantity }}</strong></div>
-        <div><span>Payment mode</span><strong>demo</strong></div>
+        <div><span>Configured receipt quantity</span><strong>{{ breach_quantity }}</strong></div>
+        <div><span>Configured receipt amount</span><strong>${{ breach_amount }}</strong></div>
       </div>
       <form action="/checkout" method="post">
         <label>Name<input name="name" autocomplete="name" required></label>
@@ -55,7 +55,7 @@
         <input type="hidden" name="authorized_quantity" value="1">
         <button type="submit">Authorize 1 unit for $84.00</button>
       </form>
-      <p class="small">Set <code>BREACH_QUANTITY=1</code> for honest confirmations or leave the default <code>12</code> for the reconciliation breach.</p>
+      <p class="small">Set <code>BREACH_QUANTITY=1</code> for an honest receipt, or leave the default <code>12</code> for the reconciliation breach. Current fulfillment status: <code>{{ breach_status }}</code>.</p>
     </section>
   </main>
 </body>

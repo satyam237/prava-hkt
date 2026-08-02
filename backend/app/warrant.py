@@ -37,7 +37,7 @@ import binascii
 import json
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TypeVar
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -45,11 +45,17 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from pydantic import BaseModel
 
 from app.models import Warrant
 
-#: Fields omitted from the signed bytes. Only the signature itself.
+#: Fields omitted from the signed bytes. Only the signature itself, and only at
+#: the top level — a warrant nested inside a dispute packet keeps its own
+#: signature in the outer bytes, which is what chains the two together.
 UNSIGNED_FIELDS: frozenset[str] = frozenset({"signature"})
+
+#: Any model carrying a ``signature`` field: a Warrant or a DisputePacket.
+SignedModel = TypeVar("SignedModel", bound=BaseModel)
 
 #: Algorithm tag prefixed to the base64 signature on the wire.
 SIGNATURE_PREFIX = "ed25519:"
@@ -75,16 +81,16 @@ class WarrantKeyError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def to_document(warrant: Warrant | Mapping[str, Any]) -> dict[str, Any]:
-    """Render a Warrant (or an already-parsed JSON mapping) as a plain JSON dict."""
-    if isinstance(warrant, Warrant):
+def to_document(warrant: BaseModel | Mapping[str, Any]) -> dict[str, Any]:
+    """Render a signed model (or an already-parsed JSON mapping) as a JSON dict."""
+    if isinstance(warrant, BaseModel):
         return warrant.model_dump(mode="json")
     if isinstance(warrant, Mapping):
         return dict(warrant)
-    raise TypeError(f"expected a Warrant or a mapping, got {type(warrant).__name__}")
+    raise TypeError(f"expected a signed model or a mapping, got {type(warrant).__name__}")
 
 
-def canonical_bytes(warrant: Warrant | Mapping[str, Any]) -> bytes:
+def canonical_bytes(warrant: BaseModel | Mapping[str, Any]) -> bytes:
     """Return the exact bytes that are signed and verified.
 
     Accepts either a :class:`~app.models.Warrant` or the raw JSON mapping loaded
@@ -205,19 +211,27 @@ def decode_signature(signature: str) -> bytes:
     return raw
 
 
-def sign_warrant(warrant: Warrant, private_key: Ed25519PrivateKey | None = None) -> Warrant:
-    """Return a copy of ``warrant`` carrying a valid signature.
+def sign_document(
+    document: SignedModel, private_key: Ed25519PrivateKey | None = None
+) -> SignedModel:
+    """Return a copy of ``document`` carrying a valid signature.
 
     The input is not mutated. Any signature already present is ignored — it is
-    excluded from the signed bytes, so re-signing is well defined.
+    excluded from the signed bytes, so re-signing is well defined. A nested
+    document's signature is *not* excluded, so signing a dispute packet commits
+    to the warrant inside it exactly as issued.
     """
     key = private_key if private_key is not None else load_signing_key()
-    raw_signature = key.sign(canonical_bytes(warrant))
-    return warrant.model_copy(update={"signature": encode_signature(raw_signature)})
+    raw_signature = key.sign(canonical_bytes(document))
+    return document.model_copy(update={"signature": encode_signature(raw_signature)})
+
+
+def sign_warrant(warrant: Warrant, private_key: Ed25519PrivateKey | None = None) -> Warrant:
+    return sign_document(warrant, private_key)
 
 
 def verify_warrant(
-    warrant: Warrant | Mapping[str, Any],
+    warrant: BaseModel | Mapping[str, Any],
     public_key: Ed25519PublicKey | None = None,
 ) -> bool:
     """Return True iff the document's signature matches its canonical bytes.
@@ -243,6 +257,11 @@ def verify_warrant(
     except InvalidSignature:
         return False
     return True
+
+
+#: Verification is a pure function of the document, so the same code checks a
+#: dispute packet. The alias exists only so those call sites read honestly.
+verify_document = verify_warrant
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +308,7 @@ __all__ = [
     "PUBLIC_KEY_ENV",
     "SIGNATURE_PREFIX",
     "SIGNING_KEY_ENV",
+    "SignedModel",
     "UNSIGNED_FIELDS",
     "WarrantKeyError",
     "canonical_bytes",
@@ -301,7 +321,9 @@ __all__ = [
     "load_signing_key",
     "private_key_to_b64",
     "public_key_to_b64",
+    "sign_document",
     "sign_warrant",
     "to_document",
+    "verify_document",
     "verify_warrant",
 ]

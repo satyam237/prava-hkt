@@ -18,6 +18,25 @@ from typing import Any, Literal, TypeVar
 import httpx
 
 PROBE_TIMEOUT_SECONDS = 2.0
+
+# Per-probe budgets. A single global 2s is the wrong shape: measured against the
+# live services, RDAP alone takes 0.5–1.3s and exceeds 2s under concurrent
+# fan-out with a cold cache, and the injection scan is an LLM round trip that
+# cannot finish in 2s at all — a blanket 2s makes it permanently UNAVAILABLE.
+# Probes still stream as they complete, so a slower probe delays only itself.
+PROBE_TIMEOUT_OVERRIDES: dict[str, float] = {
+    "domain_age_days": 4.0,
+    "safe_browsing": 3.0,
+    "injection_scan": 8.0,
+}
+
+# A verdict needs corroboration, not just an absence of failures. Excluding
+# UNAVAILABLE probes from the denominator (§4.4) means one surviving probe would
+# otherwise score 1.00 and CLEAR — and TLS validity is free for an attacker, so
+# that one probe is usually TLS. Below this many available Tier A signals the
+# gate refuses rather than guesses.
+MIN_AVAILABLE_TIER_A = 2
+
 SignalTier = Literal["A", "B", "C", "D"]
 
 
@@ -73,12 +92,26 @@ def _normalize_signal(result: Any, *, name: str, tier: SignalTier) -> Signal:
     return result
 
 
-async def _run_with_contract(fn: ProbeCallable, *args: Any, name: str, tier: SignalTier, **kwargs: Any) -> Signal:
+def timeout_for(name: str) -> float:
+    """The hard budget for one probe, in seconds."""
+
+    return PROBE_TIMEOUT_OVERRIDES.get(name, PROBE_TIMEOUT_SECONDS)
+
+
+async def _run_with_contract(
+    fn: ProbeCallable,
+    *args: Any,
+    name: str,
+    tier: SignalTier,
+    timeout: float | None = None,
+    **kwargs: Any,
+) -> Signal:
+    budget = timeout_for(name) if timeout is None else timeout
     try:
-        result = await asyncio.wait_for(fn(*args, **kwargs), timeout=PROBE_TIMEOUT_SECONDS)
+        result = await asyncio.wait_for(fn(*args, **kwargs), timeout=budget)
         return _normalize_signal(result, name=name, tier=tier)
     except asyncio.TimeoutError:
-        return unavailable(name, tier, f"{name} timed out after {PROBE_TIMEOUT_SECONDS:.0f}s")
+        return unavailable(name, tier, f"{name} timed out after {budget:g}s")
     except ProbeUnavailable as exc:
         return unavailable(name, tier, str(exc))
     except Exception as exc:  # noqa: BLE001 - the contract forbids escaping probe errors.
@@ -141,6 +174,16 @@ def score_signals(signals: Iterable[Signal]) -> float:
     return passed / len(available)
 
 
+def available_tier_a(signals: Iterable[Signal]) -> int:
+    """Count Tier A signals that produced usable evidence."""
+
+    return sum(
+        1
+        for signal in signals
+        if signal.tier == "A" and signal.status is not SignalStatus.UNAVAILABLE
+    )
+
+
 def verdict(signals: Iterable[Signal], *, threshold: float = 0.70) -> str:
     """Binary PASS/HALT gate with hard-fail signals before corroboration score."""
 
@@ -150,15 +193,35 @@ def verdict(signals: Iterable[Signal], *, threshold: float = 0.70) -> str:
             continue
         if signal.name in {"safe_browsing", "domain_age_days", "injection_scan", "tls_certificate", "tls"}:
             return "HALT"
+    # Corroboration floor, checked before the score. Without it, a run where
+    # every probe but TLS went UNAVAILABLE scores 1.00 and CLEARs — and a valid
+    # certificate costs an attacker nothing.
+    if available_tier_a(signal_list) < MIN_AVAILABLE_TIER_A:
+        return "HALT"
     return "PASS" if score_signals(signal_list) >= threshold else "HALT"
 
 
-async def fetch_json(method: str, url: str, *, client: httpx.AsyncClient | None = None, **kwargs: Any) -> JsonResponse:
-    """Fetch JSON or raise ``ProbeUnavailable`` for non-200/malformed responses."""
+async def fetch_json(
+    method: str,
+    url: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float | None = None,
+    **kwargs: Any,
+) -> JsonResponse:
+    """Fetch JSON or raise ``ProbeUnavailable`` for non-200/malformed responses.
+
+    ``timeout`` must match the caller's probe budget. A transport timeout below
+    the outer ``asyncio.wait_for`` budget silently caps the probe at the lower of
+    the two — the reason RDAP failed at 2s despite a 4s probe budget.
+    """
 
     owns_client = client is None
     if owns_client:
-        client = httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS, follow_redirects=True)
+        client = httpx.AsyncClient(
+            timeout=PROBE_TIMEOUT_SECONDS if timeout is None else timeout,
+            follow_redirects=True,
+        )
     try:
         assert client is not None
         response = await client.request(method, url, **kwargs)
@@ -176,12 +239,22 @@ async def fetch_json(method: str, url: str, *, client: httpx.AsyncClient | None 
             await client.aclose()
 
 
-async def fetch_text(method: str, url: str, *, client: httpx.AsyncClient | None = None, **kwargs: Any) -> str:
+async def fetch_text(
+    method: str,
+    url: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float | None = None,
+    **kwargs: Any,
+) -> str:
     """Fetch text or raise ``ProbeUnavailable`` for non-200 responses."""
 
     owns_client = client is None
     if owns_client:
-        client = httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS, follow_redirects=True)
+        client = httpx.AsyncClient(
+            timeout=PROBE_TIMEOUT_SECONDS if timeout is None else timeout,
+            follow_redirects=True,
+        )
     try:
         assert client is not None
         response = await client.request(method, url, **kwargs)

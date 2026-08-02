@@ -83,7 +83,9 @@ async def test_charge_rejects_more_than_two_decimal_places():
 
 async def test_decimal_and_int_amounts_normalize_to_strings():
     captured: list[httpx.Request] = []
-    client = make_client(json_route(200, {"status": "awaiting_result"}, capture=captured))
+    client = make_client(
+        json_route(200, {"status": "awaiting_result"}, capture=captured)
+    )
 
     await client.charge_mandate(MANDATE_ID, Decimal("84.00"))
     await client.charge_mandate(MANDATE_ID, 84)
@@ -100,7 +102,9 @@ async def test_decimal_and_int_amounts_normalize_to_strings():
 
 
 async def test_health_returns_ok():
-    client = make_client(json_route(200, {"status": "ok", "timestamp": "2026-08-02T00:00:00Z"}))
+    client = make_client(
+        json_route(200, {"status": "ok", "timestamp": "2026-08-02T00:00:00Z"})
+    )
     result = await client.health()
     assert result["status"] == "ok"
 
@@ -128,25 +132,31 @@ async def test_create_mandate_session_sends_the_documented_body():
     result = await client.create_mandate_session(
         user_id="user_123",
         user_email="jane@example.com",
-        total_amount="84.00",
-        merchant_name="Northstar Supply",
-        merchant_url="https://breach.localhost",
-        description="widget",
+        total_amount="49.99",
+        merchant_name="Acme Store",
+        merchant_url="https://acme.example.com",
+        description="Widget",
+        unit_price="24.99",
+        quantity=2,
+        callback_url="https://acme.example.com/return",
     )
 
     import json
 
     body = json.loads(captured[0].content)
     assert captured[0].url.path == "/v1/sessions"
-    assert body["total_amount"] == "84.00"
+    assert body["total_amount"] == "49.99"
     assert body["currency"] == "USD"
+    assert body["integration_type"] == "full_checkout"
+    assert body["callback_url"] == "https://acme.example.com/return"
     # Exactly one entry — Prava rejects multi-merchant sessions.
     assert len(body["purchase_context"]) == 1
     ctx = body["purchase_context"][0]
-    assert ctx["merchant_details"]["name"] == "Northstar Supply"
+    assert ctx["merchant_details"]["name"] == "Acme Store"
+    assert ctx["merchant_details"]["url"] == "https://acme.example.com"
     assert ctx["merchant_details"]["country_code_iso2"] == "US"
-    assert ctx["product_details"][0]["unit_price"] == "84.00"
-    assert ctx["product_details"][0]["quantity"] == 1
+    assert ctx["product_details"][0]["unit_price"] == "24.99"
+    assert ctx["product_details"][0]["quantity"] == 2
     # mandate_setup is what makes the session authorize-only.
     assert body["mandate_setup"] == {
         "intent": "mandate_setup",
@@ -238,7 +248,9 @@ async def test_charge_replay_with_the_same_reference_is_deduplicated():
 
 async def test_charge_omits_reference_when_not_given():
     captured: list[httpx.Request] = []
-    client = make_client(json_route(200, {"status": "awaiting_result"}, capture=captured))
+    client = make_client(
+        json_route(200, {"status": "awaiting_result"}, capture=captured)
+    )
     await client.charge_mandate(MANDATE_ID, "84.00")
     import json
 
@@ -249,7 +261,9 @@ async def test_charge_rejects_multi_entry_purchase_context():
     client = make_client(json_route(200, {}))
     entry = {"merchant_details": {}, "product_details": []}
     with pytest.raises(ValueError, match="exactly one entry"):
-        await client.charge_mandate(MANDATE_ID, "84.00", purchase_context=[entry, entry])
+        await client.charge_mandate(
+            MANDATE_ID, "84.00", purchase_context=[entry, entry]
+        )
 
 
 async def test_over_cap_charge_raises_threshold_exceeded():
@@ -355,7 +369,9 @@ async def test_missing_auth_raises_auth_required():
 
 async def test_validation_error_maps_to_val_2001():
     client = make_client(
-        json_route(400, {"code": "VAL_2001", "message": "total_amount has too many decimals"})
+        json_route(
+            400, {"code": "VAL_2001", "message": "total_amount has too many decimals"}
+        )
     )
     with pytest.raises(PravaValidationError) as exc_info:
         await client.get_mandate(MANDATE_ID)
@@ -425,7 +441,9 @@ async def test_get_payment_result_carries_credentials_while_awaiting_result():
 async def test_get_payment_result_surfaces_a_nested_error_object():
     """Session errors nest under `error`, unlike a charge's flat errorCode."""
     client = make_client(
-        json_route(403, {"error": {"code": "MANDATE_FORBIDDEN", "message": "not yours"}})
+        json_route(
+            403, {"error": {"code": "MANDATE_FORBIDDEN", "message": "not yours"}}
+        )
     )
     with pytest.raises(PravaError) as exc_info:
         await client.get_payment_result(SESSION_ID)
@@ -442,7 +460,10 @@ async def test_report_status_posts_the_documented_body():
 
     assert captured[0].url.path == f"/v1/sessions/{SESSION_ID}/report-status"
     # Uppercased for us — the API only accepts APPROVED / DECLINED.
-    assert json.loads(captured[0].content) == {"txn_ref_id": "ref_1", "txn_status": "APPROVED"}
+    assert json.loads(captured[0].content) == {
+        "txn_ref_id": "ref_1",
+        "txn_status": "APPROVED",
+    }
 
 
 async def test_report_status_rejects_an_unknown_status():
@@ -451,11 +472,25 @@ async def test_report_status_rejects_an_unknown_status():
         await client.report_status(SESSION_ID, "ref_1", "MAYBE")
 
 
-async def test_revoke_session_refuses_to_guess_an_endpoint():
-    """No revoke endpoint is documented; a fake one would silently no-op."""
-    client = make_client(json_route(200, {}))
-    with pytest.raises(NotImplementedError, match="report_status"):
+async def test_revoke_session_posts_to_the_documented_path():
+    captured: list[httpx.Request] = []
+    client = make_client(json_route(200, {"status": "revoked"}, capture=captured))
+    await client.revoke_session(SESSION_ID)
+
+    assert captured[0].method == "POST"
+    assert captured[0].url.path == f"/v1/sessions/{SESSION_ID}/revoke"
+
+
+async def test_revoke_session_surfaces_invalid_state():
+    """A completed or expired session is not revocable."""
+    client = make_client(
+        json_route(
+            400, {"error": {"code": "INVALID_STATE", "message": "not revocable"}}
+        )
+    )
+    with pytest.raises(PravaError) as exc_info:
         await client.revoke_session(SESSION_ID)
+    assert exc_info.value.code == "INVALID_STATE"
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +537,9 @@ def test_redact_blanks_credentials_at_every_depth():
     payload = {
         "status": "awaiting_result",
         "credentials": {"token": "4111111111111111", "dynamicCvv": "123"},
-        "transactions": [{"line_items": [{"token": "tok_secret", "dynamic_cvv": "999"}]}],
+        "transactions": [
+            {"line_items": [{"token": "tok_secret", "dynamic_cvv": "999"}]}
+        ],
     }
     clean = redact(payload)
     text = repr(clean)

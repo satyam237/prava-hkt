@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Verify a signed WARRANT offline.
+"""Verify a signed WARRANT, or a signed dispute packet, offline.
 
     python scripts/verify_warrant.py signed_warrant.json
+    python scripts/verify_warrant.py dispute_packet.json
 
 Depends on nothing but ``cryptography`` and the standard library. No FastAPI, no
 application config, no database — hand this file, the JSON document, and
 ``keys/warrant_public.key`` to anyone and they can check the signature themselves.
+
+A dispute packet embeds the original warrant with its own signature intact. Both
+signatures are checked here, separately: the outer one over the packet, the inner
+one over the warrant exactly as it was issued. The packet is valid only if both
+hold, which is what makes the chain worth anything — an outer signature over an
+unverifiable warrant proves only that we said so twice.
 
 The canonical serialization below is written out longhand rather than imported
 from the application on purpose: it is an independent reimplementation of
@@ -33,6 +40,7 @@ except ImportError:  # pragma: no cover
     raise SystemExit(2)
 
 SIGNATURE_PREFIX = "ed25519:"
+DISPUTE_VERSION = "dispute/1"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PUBLIC_KEY_PATH = REPO_ROOT / "keys" / "warrant_public.key"
 
@@ -135,6 +143,74 @@ def describe(document: dict[str, Any], key_path: Path) -> str:
     return "\n".join(lines)
 
 
+def describe_dispute(document: dict[str, Any], key_path: Path) -> str:
+    """Summary of a dispute packet: what was authorized, and what happened.
+
+    As with :func:`describe`, nothing here has been verified yet.
+    """
+    outcome = document.get("outcome")
+    outcome = outcome if isinstance(outcome, dict) else {}
+    reconciliation = document.get("reconciliation")
+    reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
+
+    lines = [
+        f"  dispute     {_clean(_get(document, 'dispute_id'), limit=80)}",
+        f"  version     {_clean(_get(document, 'version'), limit=40)}",
+        f"  verdict     {_clean(_get(reconciliation, 'status'), limit=16)}",
+        f"  order       {_clean(_get(outcome, 'order_id'), limit=80)}",
+        f"  observed    {_clean(_get(outcome, 'merchant_domain'), limit=80)} "
+        f"charged {_clean(_get(outcome, 'amount'), limit=32)} "
+        f"{_clean(_get(outcome, 'currency'), limit=16)} for "
+        f"{_clean(_get(outcome, 'quantity'), limit=16)} x "
+        f"{_clean(_get(outcome, 'sku'), limit=40)}",
+        f"  observed by {_clean(_get(outcome, 'source'), limit=80)} "
+        f"at {_clean(_get(outcome, 'observed_at'), limit=40)}",
+    ]
+
+    breaches = reconciliation.get("breaches")
+    for breach in breaches if isinstance(breaches, list) else []:
+        if not isinstance(breach, dict):
+            continue
+        detail = f" ({_clean(breach.get('detail'), limit=80)})" if breach.get("detail") else ""
+        lines.append(
+            f"  breach      {_clean(breach.get('code'), limit=32)} "
+            f"[{_clean(breach.get('provenance'), limit=16)}] "
+            f"authorized {_clean(breach.get('expected'), limit=48)}, "
+            f"observed {_clean(breach.get('observed'), limit=48)}{detail}"
+        )
+
+    lines.append(f"  issued at   {_clean(_get(document, 'issued_at'), limit=40)}")
+    lines.append("")
+    lines.append("  embedded WARRANT")
+    warrant = document.get("warrant")
+    lines.append(describe(warrant if isinstance(warrant, dict) else {}, key_path))
+    return "\n".join(lines)
+
+
+def check_signature(
+    document: dict[str, Any], public_key: Ed25519PublicKey, label: str = ""
+) -> tuple[bool, str]:
+    """Verify one document's own signature over its own canonical bytes.
+
+    Returns ``(ok, reason)`` rather than printing, so a packet can report the
+    outer and the inner result independently.
+    """
+    prefix = f"{label}: " if label else ""
+    message = canonical_bytes(document)
+    try:
+        raw_signature = decode_signature(document.get("signature"))
+    except ValueError as exc:  # binascii.Error subclasses ValueError
+        return False, f"{prefix}{exc}"
+    try:
+        public_key.verify(raw_signature, message)
+    except InvalidSignature:
+        return False, (
+            f"{prefix}signature does not match this document; "
+            "it was altered after signing, or signed by another key"
+        )
+    return True, f"{prefix}ed25519 signature verified over {len(message)} canonical bytes"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="verify_warrant.py",
@@ -187,29 +263,33 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"error: {args.warrant} cannot be canonicalized: {exc}\n")
         return 2
 
-    print("WARRANT")
-    print(describe(document, key_path))
+    is_dispute = document.get("version") == DISPUTE_VERSION
+    if is_dispute:
+        print("WARRANT DISPUTE PACKET")
+        print(describe_dispute(document, key_path))
+    else:
+        print("WARRANT")
+        print(describe(document, key_path))
     if args.show_canonical:
         print(RULE)
         print("  signed bytes:")
         print(f"  {_clean(message.decode('utf-8'), limit=None)}")
     print(RULE)
 
-    try:
-        raw_signature = decode_signature(document.get("signature"))
-    except ValueError as exc:  # binascii.Error subclasses ValueError
-        print(f"  INVALID - {exc}")
-        return 1
+    # A dispute packet is two documents, checked separately: the packet, and the
+    # warrant it embeds exactly as issued. Both must hold.
+    checks = [(document, "dispute packet" if is_dispute else "")]
+    if is_dispute:
+        embedded = document.get("warrant")
+        if not isinstance(embedded, dict):
+            print("  INVALID - dispute packet does not embed a warrant object")
+            return 1
+        checks.append((embedded, "embedded warrant"))
 
-    try:
-        public_key.verify(raw_signature, message)
-    except InvalidSignature:
-        print("  INVALID - signature does not match this document")
-        print("            the document was altered after signing, or was signed by another key")
-        return 1
-
-    print(f"  VALID - ed25519 signature verified over {len(message)} canonical bytes")
-    return 0
+    results = [check_signature(target, public_key, label) for target, label in checks]
+    for ok, reason in results:
+        print(f"  {'VALID' if ok else 'INVALID'} - {reason}")
+    return 0 if all(ok for ok, _ in results) else 1
 
 
 if __name__ == "__main__":

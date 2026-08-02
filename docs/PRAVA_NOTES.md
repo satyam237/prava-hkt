@@ -192,43 +192,88 @@ the failure is only visible via the session.
 The session is terminal at this point: `status: "failed"` and the checkout link
 is already consumed (§2.4). Recovery is a brand-new session, not a retry.
 
-## 4. `revoke_session` — no such endpoint
+## 4. `revoke_session` — CORRECTED: the endpoint does exist
 
-No session-revocation endpoint is documented, and none was found. The client's
-`revoke_session()` deliberately raises `NotImplementedError` rather than
-guessing a verb and path: a method that appears to revoke and silently does
-nothing is worse than an honest failure.
+An earlier revision of this document claimed no session-revocation endpoint was
+documented, and `revoke_session()` raised `NotImplementedError` on that basis.
+**That was wrong.** `POST /v1/sessions/{id}/revoke` is documented in two places:
 
-To end a session early, report the transaction `DECLINED` via
-`POST /v1/sessions/{id}/report-status`. Otherwise sessions expire on their own
-after 15 minutes.
+- `https://docs.prava.space/authentication.md` — session tokens are
+  "**Revocable**: can be revoked via `POST /v1/sessions/:id/revoke`"
+- `https://docs.prava.space/api-reference/errors.md` — lists its error codes,
+  `404 NOT_FOUND` and `400 INVALID_STATE` ("Session not in a revocable state /
+  It may already be completed or expired")
+
+The client now calls it. Still unverified against the live sandbox.
+
+Sessions also expire on their own after 15 minutes, so revoking is about closing
+the approval window early rather than cleanup.
 
 ---
 
-## 5. Post-approval flow — UNVERIFIED
+## 5. Post-approval flow — VERIFIED 2026-08-02
 
-**Nothing in this section has been observed.** It lists what the docs claim and
-what still needs confirming — not findings.
+Successful path used a body matching the docs CURL example
+(`user_123` / `jane@example.com` / `Acme Store` / `https://acme.example.com` /
+`integration_type: "full_checkout"` / `callback_url` / `mandate_setup`), plus
+the account-provisioned test card. Earlier failures used `*.localhost` or
+`github.com` merchant URLs and a non-docs-shaped body.
 
-Blocked on a human passkey approval (Touch ID in the hosted iframe), which no
-script can perform. One attempt was made and **failed** at passkey registration
-(§3.1), so no mandate has reached `active` and no credential has been issued.
-The client's post-approval methods (`get_mandate`, `charge_mandate`,
-`report_status`) are therefore exercised only against mocked responses in
-`tests/test_prava_client.py`, built from the documented shapes — which §2 and
-§3 have already shown can differ from the live API. Expect surprises here.
+### 5.1 Payment-result after mandate-setup approval
 
-Once an approval lands, `python scripts/prava_smoke.py resume` exercises the
-rest, and this section should record:
+Stays at `status: "processing"` with txn `status: "authorized"` for at least
+45s. **No `mandate_id` field.** Credentials stay null (authorize-only). Products
+ARE echoed on success (unlike the failed path in §3.1). Undocumented session
+status value: `"processing"`.
 
-- [ ] `GET /v1/mandates/{id}` → does `status` actually pass through `pending` → `active`?
-- [ ] Are `approvedAmount` / `spent` decimal **strings** as documented, or numbers?
-- [ ] `POST /v1/mandates/{id}/charge` → does `credentials` carry `token` + `dynamicCvv`?
-- [ ] Does `charges[]` use `transactionId` / `createdAt` camelCase as documented?
-      (Note: sessions use `snake_case` and mandates use `camelCase` — the two
-      endpoint families disagree, so do not assume one convention.)
-- [ ] Over-cap charge of `1008.00` against an `84.00` mandate → `THRESHOLD_EXCEEDED`?
-- [ ] Does `deduplicated: true` come back on a reference replay?
+### 5.2 Where the mandate id actually lives
+
+`GET /v1/mandates` returns it immediately after approval:
+
+```json
+{
+  "id": "mdt_…",
+  "externalUserId": "user_123",
+  "status": "active",
+  "state": "available",
+  "approvedAmount": "49.99",
+  "remaining": "49.99",
+  "spent": "0.00",
+  "currency": "USD",
+  "merchantScope": "listed",
+  "recurringFrequency": "one_time"
+}
+```
+
+Amounts are decimal **strings**. Mandate family uses **camelCase**. After a
+successful charge: `state: "consumed"`, `remaining: "0.00"`, `spent: "49.99"`,
+`chargeCount: 1`, `charges[].transactionId` / `createdAt` as documented.
+
+### 5.3 Charge
+
+`POST /v1/mandates/{id}/charge` with `amount: "49.99"` →
+`status: "awaiting_result"`, `fetchStatus: "SUCCESS"`, credentials present
+(`token` + `dynamicCvv`). Also returns undocumented `dynamicData` /
+`hasDynamicData`.
+
+### 5.4 Over-cap / amount scoping — HARD DECLINE, no tip tolerance
+
+Charge of `"52.00"` against a mandate that had already spent its `$49.99` cap
+returned HTTP 200 with:
+
+```json
+{
+  "status": "failed",
+  "fetchStatus": "FAILURE",
+  "errorCode": "DECLINED",
+  "errorMessage": "Visa did not return COMPLETED (status DECLINED): Total amount 101.99 exceeds threshold 49.99 · visaCorrelationId=…"
+}
+```
+
+Notes: error code is **`DECLINED`**, not the documented `THRESHOLD_EXCEEDED`.
+Visa enforces a **cumulative** threshold (`49.99 + 52.00 = 101.99`), not only
+the per-charge amount. No 15–20% tip/fuel headroom observed. AMOUNT_EXCEEDED is
+a real prevented-breach demo, not redundant with network enforcement wording.
 
 ---
 

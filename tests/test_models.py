@@ -12,6 +12,8 @@ from app.models import (
     Authorization,
     Breach,
     BreachCode,
+    BreachProvenance,
+    DisputePacket,
     Outcome,
     Reconciliation,
     ReconciliationStatus,
@@ -273,3 +275,39 @@ def test_all_five_breach_codes_exist():
 def test_settled_reconciliation_has_no_breaches():
     reconciliation = Reconciliation(warrant_id="wrt_abc", status="SETTLED")
     assert reconciliation.breaches == []
+
+
+def test_a_breach_is_detected_unless_something_refused_it():
+    """Post-hoc detection is the default; PREVENTED needs a refusal to point at."""
+    assert Breach(code=BreachCode.ITEM_MISMATCH).provenance is BreachProvenance.DETECTED
+
+    prevented = Breach(
+        code=BreachCode.AMOUNT_EXCEEDED,
+        provenance=BreachProvenance.PREVENTED,
+        evidence="THRESHOLD_EXCEEDED",
+    )
+    assert prevented.model_dump(mode="json")["provenance"] == "PREVENTED"
+    assert prevented.model_dump(mode="json")["evidence"] == "THRESHOLD_EXCEEDED"
+
+
+def test_dispute_packet_keeps_the_warrant_signature(warrant):
+    packet = DisputePacket(
+        warrant=warrant.model_copy(update={"signature": "ed25519:" + "A" * 88}),
+        outcome=Outcome(warrant_id=warrant.warrant_id, merchant_domain="ridge.com"),
+        reconciliation=Reconciliation(warrant_id=warrant.warrant_id, status="BREACH"),
+    )
+    document = packet.model_dump(mode="json")
+    assert document["version"] == "dispute/1"
+    assert document["dispute_id"].startswith("dsp_")
+    assert document["warrant"]["signature"].startswith("ed25519:")
+    assert document["signature"] is None
+
+
+def test_dispute_packet_rejects_unknown_fields(warrant):
+    with pytest.raises(ValidationError):
+        DisputePacket(
+            warrant=warrant,
+            outcome=Outcome(warrant_id=warrant.warrant_id, merchant_domain="ridge.com"),
+            reconciliation=Reconciliation(warrant_id=warrant.warrant_id, status="BREACH"),
+            filed_with="the issuer",
+        )

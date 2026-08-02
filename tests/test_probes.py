@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.probes import injection, rdap, safebrowsing, tls
-from app.probes.base import Signal, SignalStatus, probe, run_probes, score_signals
+from app.probes import base, injection, rdap, safebrowsing, tls
+from app.probes.base import Signal, SignalStatus, probe, run_probes, score_signals, verdict
 
 
 class FakeResponse:
@@ -81,6 +81,43 @@ def test_unavailable_is_excluded_from_score_denominator():
     assert score_signals(signals) == 1.0
 
 
+def test_a_single_surviving_probe_scores_perfectly_but_still_halts():
+    """The corroboration floor, and why it exists.
+
+    Excluding UNAVAILABLE from the denominator means one surviving probe scores
+    1.00. If that probe is TLS — which costs an attacker nothing — a perfect
+    score would clear a scam storefront. The score is still 1.00; the gate
+    refuses anyway.
+    """
+    signals = [
+        Signal("tls_certificate", "A", "valid", SignalStatus.PASS),
+        Signal("domain_age_days", "A", None, SignalStatus.UNAVAILABLE),
+        Signal("safe_browsing", "A", None, SignalStatus.UNAVAILABLE),
+        Signal("injection_scan", "D", None, SignalStatus.UNAVAILABLE),
+    ]
+    assert score_signals(signals) == 1.0
+    assert verdict(signals) == "HALT"
+
+
+def test_two_available_tier_a_signals_clear_the_floor():
+    signals = [
+        Signal("tls_certificate", "A", "valid", SignalStatus.PASS),
+        Signal("domain_age_days", "A", 2847, SignalStatus.PASS),
+        Signal("safe_browsing", "A", None, SignalStatus.UNAVAILABLE),
+        Signal("injection_scan", "D", None, SignalStatus.UNAVAILABLE),
+    ]
+    assert verdict(signals) == "PASS"
+
+
+def test_tier_d_alone_does_not_satisfy_the_floor():
+    """Only Tier A signals count toward corroboration."""
+    signals = [
+        Signal("tls_certificate", "A", "valid", SignalStatus.PASS),
+        Signal("injection_scan", "D", "clean", SignalStatus.PASS),
+    ]
+    assert verdict(signals) == "HALT"
+
+
 @pytest.mark.asyncio
 async def test_rdap_extracts_registration_date_from_events_payload():
     payload = {
@@ -127,19 +164,34 @@ async def test_rdap_non_200_malformed_and_timeout_are_unavailable():
 
 @pytest.mark.asyncio
 async def test_safe_browsing_missing_key_is_unavailable(monkeypatch):
+    monkeypatch.delenv("GOOGLE_WEB_RISK_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_SAFE_BROWSING_API_KEY", raising=False)
     result = await safebrowsing.run("example.com")
     assert result.status is SignalStatus.UNAVAILABLE
-    assert "GOOGLE_SAFE_BROWSING_API_KEY" in result.detail
+    assert "GOOGLE_WEB_RISK_API_KEY" in result.detail
 
 
 @pytest.mark.asyncio
-async def test_safe_browsing_empty_object_passes_and_matches_fail():
+async def test_safe_browsing_requests_the_web_risk_endpoint():
+    """Web Risk `uris:search`, not the deprecated Safe Browsing v4 POST."""
+    fake = FakeClient(FakeResponse(payload={}))
+    await safebrowsing.run("example.com", api_key="test", client=fake)
+
+    url = str(fake.requests[0][1])
+    assert url.startswith("https://webrisk.googleapis.com/v1/uris:search?")
+    # threatTypes repeats rather than being comma-joined.
+    assert url.count("threatTypes=") == 3
+    assert "uri=https%3A%2F%2Fexample.com%2F" in url
+
+
+@pytest.mark.asyncio
+async def test_safe_browsing_empty_object_passes_and_threat_fails():
+    """A clean URI returns `{}`; a hit nests under `threat`."""
     clean = await safebrowsing.run("example.com", api_key="test", client=FakeClient(FakeResponse(payload={})))
     hit = await safebrowsing.run(
         "example.com",
         api_key="test",
-        client=FakeClient(FakeResponse(payload={"matches": [{"threatType": "SOCIAL_ENGINEERING"}]})),
+        client=FakeClient(FakeResponse(payload={"threat": {"threatTypes": ["SOCIAL_ENGINEERING"]}})),
     )
 
     assert clean.status is SignalStatus.PASS
@@ -149,10 +201,11 @@ async def test_safe_browsing_empty_object_passes_and_matches_fail():
 
 
 @pytest.mark.asyncio
-async def test_safe_browsing_non_200_malformed_and_timeout_are_unavailable():
+async def test_safe_browsing_non_200_malformed_and_timeout_are_unavailable(monkeypatch):
+    monkeypatch.setitem(base.PROBE_TIMEOUT_OVERRIDES, "safe_browsing", 0.1)
     non_200 = await safebrowsing.run("example.com", api_key="test", client=FakeClient(FakeResponse(status_code=500)))
-    malformed = await safebrowsing.run("example.com", api_key="test", client=FakeClient(FakeResponse(payload={"matches": "bad"})))
-    timed_out = await safebrowsing.run("example.com", api_key="test", client=FakeClient(FakeResponse(payload={}), delay=3))
+    malformed = await safebrowsing.run("example.com", api_key="test", client=FakeClient(FakeResponse(payload={"threat": "bad"})))
+    timed_out = await safebrowsing.run("example.com", api_key="test", client=FakeClient(FakeResponse(payload={}), delay=1))
 
     assert non_200.status is SignalStatus.UNAVAILABLE
     assert malformed.status is SignalStatus.UNAVAILABLE
@@ -217,10 +270,13 @@ async def test_injection_structured_clean_passes_and_detected_fails():
 
 
 @pytest.mark.asyncio
-async def test_injection_non_200_malformed_and_timeout_are_unavailable():
+async def test_injection_non_200_malformed_and_timeout_are_unavailable(monkeypatch):
+    # The injection scan gets an 8s budget in production because it is an LLM
+    # round trip; shorten it here so the timeout path stays fast to test.
+    monkeypatch.setitem(base.PROBE_TIMEOUT_OVERRIDES, "injection_scan", 0.1)
     non_200 = await injection.run("example.com", api_key="test", client=FakeClient(FakeResponse(status_code=500)))
     malformed = await injection.run("example.com", content="x", api_key="test", openai_client=FakeOpenAI("not-json"))
-    timed_out = await injection.run("example.com", content="x", api_key="test", openai_client=FakeOpenAI('{"detected": false, "excerpt": null, "rationale": "clean"}', delay=3))
+    timed_out = await injection.run("example.com", content="x", api_key="test", openai_client=FakeOpenAI('{"detected": false, "excerpt": null, "rationale": "clean"}', delay=1))
 
     assert non_200.status is SignalStatus.UNAVAILABLE
     assert malformed.status is SignalStatus.UNAVAILABLE

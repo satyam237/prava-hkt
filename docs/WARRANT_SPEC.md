@@ -1,6 +1,6 @@
 # WARRANT — wire format and signature specification
 
-**Version:** `warrant/1`
+**Versions:** `warrant/1` (§1–§8), `dispute/1` (§9)
 **Status:** stable for the hackathon build. Any change to canonical serialization is a version bump, not a patch.
 
 A WARRANT is a signed statement that a merchant was verified and that spending was authorized against that verification, scoped narrowly. It is the system's portable artifact: it leaves the machine that produced it, and anyone holding the public key can check it without contacting us.
@@ -272,13 +272,48 @@ DzpbMH3nw9yjOVIKYQM+mIbjZCuid+wu+y0zRxPdV1A=
     "verdict": "PASS",
     "score": "0.87",
     "signals": [
-      { "name": "domain_age_days", "tier": "A", "value": 2847, "status": "PASS" },
-      { "name": "safe_browsing", "tier": "A", "value": "no_match", "status": "PASS" },
-      { "name": "cert_first_seen_days", "tier": "A", "value": 2790, "status": "PASS" },
-      { "name": "psp_fingerprint", "tier": "B", "value": "stripe", "status": "PASS" },
-      { "name": "ucp_manifest", "tier": "C", "value": true, "status": "PASS" },
-      { "name": "business_registry", "tier": "B", "value": null, "status": "UNAVAILABLE" },
-      { "name": "injection_scan", "tier": "D", "value": "clean", "status": "PASS" }
+      {
+        "name": "domain_age_days",
+        "tier": "A",
+        "value": 2847,
+        "status": "PASS"
+      },
+      {
+        "name": "safe_browsing",
+        "tier": "A",
+        "value": "no_match",
+        "status": "PASS"
+      },
+      {
+        "name": "cert_first_seen_days",
+        "tier": "A",
+        "value": 2790,
+        "status": "PASS"
+      },
+      {
+        "name": "psp_fingerprint",
+        "tier": "B",
+        "value": "stripe",
+        "status": "PASS"
+      },
+      {
+        "name": "ucp_manifest",
+        "tier": "C",
+        "value": true,
+        "status": "PASS"
+      },
+      {
+        "name": "business_registry",
+        "tier": "B",
+        "value": null,
+        "status": "UNAVAILABLE"
+      },
+      {
+        "name": "injection_scan",
+        "tier": "D",
+        "value": "clean",
+        "status": "PASS"
+      }
     ],
     "content_hash": "sha256:a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1"
   },
@@ -292,7 +327,7 @@ DzpbMH3nw9yjOVIKYQM+mIbjZCuid+wu+y0zRxPdV1A=
     "expected_fulfillment_by": "2026-08-12T00:00:00Z"
   },
   "issued_at": "2026-08-02T21:14:03Z",
-  "signature": "ed25519:EouS9feQoMKY6XGguw8S54S+sSMPqOY3eh/o/Tl8uYS6LiRBH9KHnfSFvznrYy9RYwHKsVy5bo9/b6WIeuZDDg=="
+  "signature": "ed25519:AI3z0mzEGHafTnXR03p2eu7EOCXTuckyCYc/pLBbEFzbcif1FpnLmKkDbAigqRNmBumTX9SsKn6KJnviMJQwBg=="
 }
 ```
 
@@ -341,14 +376,98 @@ This prints both halves to stdout and writes nothing tracked. Store the private 
 |---|---|
 | Document and reconciliation models | `backend/app/models.py` |
 | Canonical serialization, signing, verification | `backend/app/warrant.py` |
+| Deterministic diff and dispute packet | `backend/app/reconcile.py` |
+| Observed side of the diff (demo merchant receipt) | `merchants/breach/receipt.py` |
 | Standalone offline verifier | `scripts/verify_warrant.py` |
-| Contract tests | `tests/test_warrant.py`, `tests/test_models.py`, `tests/test_verify_script.py` |
+| Contract tests | `tests/test_warrant.py`, `tests/test_models.py`, `tests/test_reconcile.py`, `tests/test_verify_script.py` |
 
 `canonical_bytes()` in `backend/app/warrant.py` is the single implementation used by both signing and verification, so those two can never drift apart. `scripts/verify_warrant.py` carries a deliberately **independent** reimplementation of §3 — that is the point of it, and `tests/test_warrant.py::test_app_and_standalone_script_agree_byte_for_byte` asserts the two agree. If they ever disagree, this specification is ambiguous and must be fixed here first.
 
 ---
 
-## 9. Changing this specification
+## 9. The dispute packet
+
+**Version:** `dispute/1`
+
+A WARRANT says what was authorized. A dispute packet says what then happened, and binds the two together. It is emitted when reconciliation returns `BREACH`.
+
+It is a JSON object with exactly six top-level keys, obeying every rule in §2 and §3 unchanged:
+
+| Field | Type | Notes |
+|---|---|---|
+| `version` | string | Always `"dispute/1"` |
+| `dispute_id` | string | `"dsp_"` followed by URL-safe base64 random (128 bits) |
+| `warrant` | object | **The original WARRANT, verbatim, including its own `signature`** |
+| `outcome` | object | What was observed |
+| `reconciliation` | object | The verdict and the enumerated breaches |
+| `issued_at` | string | RFC 3339 UTC, second precision, `Z` suffix |
+| `signature` | string or null | `"ed25519:"` + base64. **Excluded from the signed bytes** |
+
+### 9.1 The nesting rule
+
+Canonicalization (§3) removes the `signature` key **at the top level only**. The embedded warrant keeps its own signature, and that single detail is what makes the chain hold in both directions:
+
+- the outer signature is computed over bytes that include the inner signature, so the warrant inside a packet cannot be swapped, softened, or re-dated;
+- the inner document is unchanged from the day it was issued, so it can be lifted out of the packet and verified entirely on its own.
+
+Two signatures, two timestamps, one verifiable chain: here is what was authorized and when, here is what happened.
+
+### 9.2 `outcome`
+
+What the observer saw. `null` means *not observed*, which is not the same as observed to be absent.
+
+| Field | Type | Notes |
+|---|---|---|
+| `warrant_id` | string | Must equal `warrant.warrant_id` |
+| `merchant_domain` | string | Who was actually charged |
+| `sku` | string or null | |
+| `description` | string or null | |
+| `quantity` | integer or null | |
+| `amount` | string or null | Decimal string, §2.2 |
+| `currency` | string or null | ISO 4217 |
+| `delivered` | boolean or null | |
+| `order_id` | string or null | The merchant's own identifier |
+| `source` | string or null | Who reported this |
+| `fulfilled_at` | string or null | RFC 3339 UTC, second precision |
+| `observed_at` | string | RFC 3339 UTC, second precision |
+
+**Where an outcome comes from matters.** It comes from the merchant, not from the payment provider. Prava's payment result echoes back the `purchase_context` the agent itself submitted, so diffing a warrant against it compares a document to itself and always settles. Prava issues tokens and never observes what ships.
+
+### 9.3 `reconciliation`
+
+| Field | Type | Notes |
+|---|---|---|
+| `warrant_id` | string | Must equal `warrant.warrant_id` |
+| `status` | string | `"SETTLED"` \| `"BREACH"`. Binary — there is no review state |
+| `breaches` | array | Ordered; order is part of the signature (§2.4) |
+| `reconciled_at` | string | RFC 3339 UTC, second precision |
+
+Each breach is:
+
+| Field | Type | Notes |
+|---|---|---|
+| `code` | string | `AMOUNT_EXCEEDED` \| `MERCHANT_MISMATCH` \| `ITEM_MISMATCH` \| `QUANTITY_MISMATCH` \| `NON_DELIVERY` |
+| `provenance` | string | `"PREVENTED"` \| `"DETECTED"` — see below |
+| `expected` | string or null | Rendered, so a breach is readable without knowing the field's type |
+| `observed` | string or null | |
+| `evidence` | string or null | The refusing authority's own error code, for `PREVENTED` |
+| `detail` | string or null | |
+
+`PREVENTED` means the charge was refused before money moved — the amount cap is enforced at the card network and merchant scope inside Prava, so `evidence` carries Prava's code (`THRESHOLD_EXCEEDED`, `MANDATE_MERCHANT_NOT_ALLOWED`) and the proof is the refusal, not our arithmetic. `DETECTED` means the charge succeeded within everything the network could check and the departure is visible only in what the merchant says it fulfilled. Only the second kind is worth disputing.
+
+The diff producing these is deterministic and contains no model. Amounts are compared as decimals and never as floats or as text; domains are compared case-folded and without a trailing dot; an authorization is a ceiling, so being charged *less* than it is not a breach.
+
+### 9.4 Verifying a packet
+
+```console
+$ python scripts/verify_warrant.py dispute_packet.json
+```
+
+The verifier dispatches on `version`, checks the outer signature over the outer canonical bytes, then lifts out `warrant` and checks that independently. Exit code `0` only if both hold. An outer signature over a warrant that does not verify proves only that we said so twice.
+
+---
+
+## 10. Changing this specification
 
 Any change to §2 or §3 changes what bytes get signed, which silently invalidates every previously issued WARRANT. Such a change requires a new `version` value (`warrant/2`), and verifiers must dispatch on `version` before canonicalizing.
 

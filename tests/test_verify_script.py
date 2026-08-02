@@ -234,6 +234,115 @@ def test_public_key_env_var_is_honoured(issuer_public_key, signed_file):
     assert "VALID" in result.stdout
 
 
+# ---------------------------------------------------------------------------
+# Dispute packets: two signatures, checked separately
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def packet_file(tmp_path, issuer):
+    """A signed dispute packet for 12 units billed at 1008.00 against a warrant for 1."""
+    from datetime import datetime, timezone
+
+    from app.models import Outcome
+    from app.reconcile import build_dispute_packet, reconcile, sign_dispute_packet
+
+    private_key = issuer[0]
+    signed = sign_warrant(build_warrant(), private_key)
+    outcome = Outcome(
+        warrant_id=signed.warrant_id,
+        merchant_domain="ridge.com",
+        sku="RW-TITAN-01",
+        quantity=12,
+        amount="1008.00",
+        currency="USD",
+        delivered=True,
+        order_id="breach-abc123",
+        source="merchant_receipt",
+    )
+    reconciliation = reconcile(signed, outcome, now=datetime(2026, 8, 3, tzinfo=timezone.utc))
+    packet = sign_dispute_packet(
+        build_dispute_packet(signed, outcome, reconciliation), private_key
+    )
+
+    path = tmp_path / "dispute_packet.json"
+    path.write_text(json.dumps(packet.model_dump(mode="json"), indent=2), encoding="utf-8")
+    return path
+
+
+def test_verifies_both_signatures_in_a_dispute_packet(verify, packet_file):
+    result = verify(str(packet_file))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "WARRANT DISPUTE PACKET" in result.stdout
+    assert "INVALID" not in result.stdout
+    valid = [line for line in result.stdout.splitlines() if "VALID" in line]
+    assert len(valid) == 2, result.stdout
+    assert "dispute packet" in valid[0]
+    assert "embedded warrant" in valid[1]
+
+
+def test_the_packet_output_shows_the_breaches_and_both_sides(verify, packet_file):
+    result = verify(str(packet_file))
+    assert "BREACH" in result.stdout
+    assert "AMOUNT_EXCEEDED" in result.stdout
+    assert "QUANTITY_MISMATCH" in result.stdout
+    assert "DETECTED" in result.stdout
+    assert "1008.00" in result.stdout
+    # The authorized side is still legible in the embedded warrant summary.
+    assert "84.00 USD" in result.stdout
+    assert "breach-abc123" in result.stdout
+
+
+def test_editing_the_observed_outcome_invalidates_the_packet(tmp_path, verify, packet_file):
+    """The whole point: the outer signature covers what the merchant did."""
+    document = json.loads(packet_file.read_text(encoding="utf-8"))
+    document["outcome"]["quantity"] = 1
+    path = tmp_path / "softened.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    result = verify(str(path))
+    assert result.returncode == 1
+    assert "INVALID - dispute packet" in result.stdout
+    # The warrant inside was not touched, and says so.
+    assert "VALID - embedded warrant" in result.stdout
+
+
+def test_tampering_with_the_embedded_warrant_invalidates_both(tmp_path, verify, packet_file):
+    document = json.loads(packet_file.read_text(encoding="utf-8"))
+    document["warrant"]["authorization"]["amount"] = "1008.00"
+    path = tmp_path / "reauthorized.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    result = verify(str(path))
+    assert result.returncode == 1
+    assert "INVALID - dispute packet" in result.stdout
+    assert "INVALID - embedded warrant" in result.stdout
+
+
+def test_a_packet_without_an_embedded_warrant_is_invalid(tmp_path, verify, packet_file):
+    document = json.loads(packet_file.read_text(encoding="utf-8"))
+    document["warrant"] = None
+    path = tmp_path / "hollow.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    result = verify(str(path))
+    assert result.returncode == 1
+    assert "INVALID" in result.stdout
+
+
+def test_packet_key_reordering_still_verifies(tmp_path, verify, packet_file):
+    document = json.loads(packet_file.read_text(encoding="utf-8"))
+    shuffled = {key: document[key] for key in reversed(list(document))}
+    shuffled["warrant"] = {
+        key: document["warrant"][key] for key in reversed(list(document["warrant"]))
+    }
+    path = tmp_path / "shuffled_packet.json"
+    path.write_text(json.dumps(shuffled), encoding="utf-8")
+
+    result = verify(str(path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_worked_example_in_the_spec_verifies(tmp_path):
     """The example in docs/WARRANT_SPEC.md must verify with the COMMITTED key."""
     from conftest import REPO_ROOT

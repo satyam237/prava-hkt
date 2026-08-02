@@ -78,6 +78,9 @@ class PravaErrorCode(str, Enum):
     """
 
     THRESHOLD_EXCEEDED = "THRESHOLD_EXCEEDED"
+    #: Live sandbox over-cap (docs/PRAVA_NOTES.md §5.4): HTTP 200 + this code,
+    #: not ``THRESHOLD_EXCEEDED``. Mapped to :class:`PravaThresholdExceeded`.
+    DECLINED = "DECLINED"
     MANDATE_MERCHANT_NOT_ALLOWED = "MANDATE_MERCHANT_NOT_ALLOWED"
     MANDATE_NOT_FOUND = "MANDATE_NOT_FOUND"
     MANDATE_FORBIDDEN = "MANDATE_FORBIDDEN"
@@ -145,10 +148,11 @@ class PravaMerchantNotAllowed(PravaError):
 
 
 class PravaThresholdExceeded(PravaError):
-    """``THRESHOLD_EXCEEDED`` — over the mandate's authorized cap.
+    """Over the mandate's authorized cap.
 
-    Enforced by the card network, not by us and not by a pre-flight check, so
-    it can arrive on a charge that looked fine locally.
+    Documented as ``THRESHOLD_EXCEEDED``; the live sandbox returns HTTP 200
+    with ``errorCode: "DECLINED"`` and a message naming the cumulative
+    threshold (``docs/PRAVA_NOTES.md`` §5.4). Both codes raise this type.
     """
 
 
@@ -170,6 +174,7 @@ _CODE_TO_EXC: dict[str, type[PravaError]] = {
     PravaErrorCode.MANDATE_NOT_FOUND.value: PravaMandateNotFound,
     PravaErrorCode.MANDATE_MERCHANT_NOT_ALLOWED.value: PravaMerchantNotAllowed,
     PravaErrorCode.THRESHOLD_EXCEEDED.value: PravaThresholdExceeded,
+    PravaErrorCode.DECLINED.value: PravaThresholdExceeded,
     PravaErrorCode.VAL_2001.value: PravaValidationError,
 }
 
@@ -206,7 +211,9 @@ def _money(value: Any, field: str = "amount") -> str:
     elif isinstance(value, int):
         value = str(value)
     if not isinstance(value, str):
-        raise ValueError(f"{field} must be a decimal string, got {type(value).__name__}")
+        raise ValueError(
+            f"{field} must be a decimal string, got {type(value).__name__}"
+        )
     if not _MONEY_RE.match(value):
         raise ValueError(
             f"{field} {value!r} is not a valid Prava amount "
@@ -366,6 +373,7 @@ class PravaClient:
         path: str,
         *,
         json: Mapping[str, Any] | None = None,
+        params: Mapping[str, Any] | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
         """Issue one request and return its decoded body, or raise a PravaError.
@@ -377,6 +385,8 @@ class PravaClient:
         kwargs: dict[str, Any] = {}
         if json is not None:
             kwargs["json"] = json
+        if params is not None:
+            kwargs["params"] = dict(params)
         if timeout is not None:
             kwargs["timeout"] = httpx.Timeout(timeout, connect=10.0)
 
@@ -400,7 +410,9 @@ class PravaClient:
 
         return self._decode(response, method=method, path=path)
 
-    def _decode(self, response: httpx.Response, *, method: str, path: str) -> dict[str, Any]:
+    def _decode(
+        self, response: httpx.Response, *, method: str, path: str
+    ) -> dict[str, Any]:
         try:
             body = response.json()
         except ValueError:
@@ -449,6 +461,8 @@ class PravaClient:
         recurring_frequency: str = "one_time",
         merchant_scope: str = "listed",
         max_charges: int = 1,
+        integration_type: str = "full_checkout",
+        callback_url: str | None = None,
     ) -> dict[str, Any]:
         """``POST /v1/sessions`` with ``mandate_setup`` — create a mandate.
 
@@ -464,16 +478,24 @@ class PravaClient:
         ``total_amount`` becomes the authorized cap. ``unit_price`` defaults to
         it, which is right for the single-product case and wrong the moment
         ``quantity`` exceeds 1 — pass it explicitly then.
+
+        ``integration_type`` defaults to ``full_checkout`` (hosted redirect),
+        matching the documented CURL example. ``callback_url`` must be https
+        when set.
         """
         if not 1 <= len(user_id) <= 255:
             raise ValueError("user_id must be 1–255 characters")
         if quantity < 1:
             raise ValueError("quantity must be at least 1")
+        if integration_type not in {"full_checkout", "embedding"}:
+            raise ValueError("integration_type must be 'full_checkout' or 'embedding'")
+        if callback_url is not None and not callback_url.startswith("https://"):
+            raise ValueError("callback_url must use https")
 
         total = _money(total_amount, "total_amount")
         unit = _money(total if unit_price is None else unit_price, "unit_price")
 
-        body = {
+        body: dict[str, Any] = {
             "user_id": user_id,
             "user_email": user_email,
             "total_amount": total,
@@ -488,6 +510,7 @@ class PravaClient:
                     quantity=quantity,
                 )
             ],
+            "integration_type": integration_type,
             "mandate_setup": {
                 "intent": "mandate_setup",
                 "recurring_frequency": recurring_frequency,
@@ -495,6 +518,8 @@ class PravaClient:
                 "max_charges": max_charges,
             },
         }
+        if callback_url is not None:
+            body["callback_url"] = callback_url
         return await self._request("POST", "/v1/sessions", json=body)
 
     async def get_payment_result(self, session_id: str) -> dict[str, Any]:
@@ -552,9 +577,52 @@ class PravaClient:
                 )
             body["purchase_context"] = purchase_context
 
-        return await self._request(
+        result = await self._request(
             "POST", f"/v1/mandates/{mandate_id}/charge", json=body, timeout=60.0
         )
+        # Live over-cap: HTTP 200 + status failed + DECLINED (§5.4). Raise so
+        # callers do not treat a refused charge as credentials issued.
+        if result.get("status") == "failed" or result.get("fetchStatus") == "FAILURE":
+            code, message = _extract_error(result)
+            exc_type = _CODE_TO_EXC.get(code or "") or PravaError
+            raise exc_type(
+                message or f"POST /v1/mandates/{mandate_id}/charge failed",
+                status_code=200,
+                code=code,
+                payload=result,
+            )
+        return result
+
+    async def list_mandates(
+        self,
+        *,
+        external_user_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """``GET /v1/mandates`` — discover mandates after passkey approval.
+
+        Payment-result after mandate-setup stays ``processing`` with no
+        ``mandate_id`` (§5.1–§5.2). Filter by ``externalUserId`` + ``status``.
+        """
+
+        params: dict[str, str] = {}
+        if external_user_id is not None:
+            params["externalUserId"] = external_user_id
+        if status is not None:
+            params["status"] = status
+        body = await self._request(
+            "GET", "/v1/mandates", params=params or None, timeout=20.0
+        )
+        raw = body.get("raw")
+        if isinstance(raw, list):
+            return [item for item in raw if isinstance(item, dict)]
+        for key in ("mandates", "data", "items"):
+            value = body.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        if isinstance(body.get("id"), str):
+            return [body]
+        return []
 
     async def report_status(
         self, session_id: str, txn_ref_id: str, txn_status: str
@@ -575,22 +643,14 @@ class PravaClient:
         )
 
     async def revoke_session(self, session_id: str) -> dict[str, Any]:
-        """Not implemented — Prava documents no session-revocation endpoint.
+        """``POST /v1/sessions/{id}/revoke`` — end a session before it is used.
 
-        Guessing a verb and path here would produce a method that appears to
-        revoke and silently does nothing, which is worse than an honest
-        failure. Sessions expire on their own after 15 minutes
-        (:data:`SESSION_TTL_SECONDS`); to end one early, report the transaction
-        ``DECLINED`` via :meth:`report_status`.
-
-        See ``docs/PRAVA_NOTES.md`` for the confirmation that no such endpoint
-        is exposed.
+        Only sessions that have not yet completed are revocable; a completed or
+        expired one returns ``400 INVALID_STATE``. Sessions also expire on their
+        own after 15 minutes (:data:`SESSION_TTL_SECONDS`), so revoking is about
+        closing the approval window early, not about cleanup.
         """
-        raise NotImplementedError(
-            "Prava documents no session-revocation endpoint. Sessions expire "
-            f"after {SESSION_TTL_SECONDS // 60} minutes; to end one early, call "
-            "report_status(session_id, txn_ref_id, 'DECLINED')."
-        )
+        return await self._request("POST", f"/v1/sessions/{session_id}/revoke")
 
 
 def _extract_error(body: Mapping[str, Any]) -> tuple[str | None, str | None]:

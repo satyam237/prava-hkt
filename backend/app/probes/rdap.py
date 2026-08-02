@@ -8,7 +8,14 @@ from typing import Any
 import httpx
 import tldextract
 
-from app.probes.base import ProbeUnavailable, Signal, SignalStatus, fetch_json, probe
+from app.probes.base import (
+    ProbeUnavailable,
+    Signal,
+    SignalStatus,
+    fetch_json,
+    probe,
+    timeout_for,
+)
 
 TIER = "A"
 NAME = "domain_age_days"
@@ -55,7 +62,14 @@ async def run(domain: str, *, client: httpx.AsyncClient | None = None, now: date
     if client is None and registrable in _CACHE:
         return _CACHE[registrable]
 
-    response = await fetch_json("GET", _RDAP_URL.format(domain=registrable), client=client)
+    # rdap.org 302-redirects to the authoritative registry server, so this is two
+    # round trips and needs the probe's full budget, not the 2s default.
+    response = await fetch_json(
+        "GET",
+        _RDAP_URL.format(domain=registrable),
+        client=client,
+        timeout=timeout_for(NAME),
+    )
     registered_at = _parse_rdap_registration_date(response.payload)
     as_of = now or datetime.now(timezone.utc)
     if as_of.tzinfo is None:

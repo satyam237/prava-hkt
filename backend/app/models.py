@@ -31,6 +31,8 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PlainSeriali
 
 WARRANT_VERSION = "warrant/1"
 WARRANT_ID_PREFIX = "wrt_"
+DISPUTE_VERSION = "dispute/1"
+DISPUTE_ID_PREFIX = "dsp_"
 
 # ---------------------------------------------------------------------------
 # Scalar contracts
@@ -165,6 +167,10 @@ def new_warrant_id() -> str:
     return WARRANT_ID_PREFIX + secrets.token_urlsafe(16)
 
 
+def new_dispute_id() -> str:
+    return DISPUTE_ID_PREFIX + secrets.token_urlsafe(16)
+
+
 # ---------------------------------------------------------------------------
 # Enumerations
 # ---------------------------------------------------------------------------
@@ -197,6 +203,24 @@ class BreachCode(str, Enum):
 class ReconciliationStatus(str, Enum):
     SETTLED = "SETTLED"
     BREACH = "BREACH"
+
+
+class BreachProvenance(str, Enum):
+    """Whether the breach was stopped or only observed afterwards.
+
+    PREVENTED: the charge was refused before money moved. The amount cap is
+    enforced at the card network and merchant scope inside Prava, so the
+    evidence is the refusal itself, not our arithmetic.
+
+    DETECTED: the charge succeeded within everything the network could check,
+    and the departure is only visible in what the merchant says it fulfilled.
+    Prava issues tokens and never sees the shipment, so this class of breach
+    can only come from the merchant's own receipt. It is the one that needs a
+    dispute packet, because the money is already gone.
+    """
+
+    PREVENTED = "PREVENTED"
+    DETECTED = "DETECTED"
 
 
 SignalTier = Literal["A", "B", "C", "D"]
@@ -281,6 +305,11 @@ class Outcome(StrictModel):
 
     Fields mirror ``Authorization`` so reconciliation is a field-by-field diff.
     ``None`` means "not observed", which is distinct from "observed as zero".
+
+    ``source`` records who said so, and it matters more than it looks: the only
+    party that knows what was shipped is the merchant. Prava's payment result
+    echoes back the purchase context we ourselves sent it, so reconciling
+    against it would compare a document to itself.
     """
 
     warrant_id: str
@@ -293,6 +322,7 @@ class Outcome(StrictModel):
     delivered: bool | None = None
     order_id: str | None = None
     source: str | None = None
+    fulfilled_at: UtcDatetime | None = None
     observed_at: UtcDatetime = Field(default_factory=utcnow)
 
 
@@ -300,12 +330,16 @@ class Breach(StrictModel):
     """One way the outcome departed from the warrant.
 
     ``expected`` and ``observed`` are rendered strings so a breach is readable
-    without knowing the field's type.
+    without knowing the field's type. ``evidence`` carries the refusing
+    authority's own error code when ``provenance`` is PREVENTED — a breach we
+    stopped is evidenced by someone else's refusal, not by our comparison.
     """
 
     code: BreachCode
+    provenance: BreachProvenance = BreachProvenance.DETECTED
     expected: str | None = None
     observed: str | None = None
+    evidence: str | None = None
     detail: str | None = None
 
 
@@ -316,14 +350,37 @@ class Reconciliation(StrictModel):
     reconciled_at: UtcDatetime = Field(default_factory=utcnow)
 
 
+class DisputePacket(StrictModel):
+    """The second signed document: what was authorized, and what happened.
+
+    ``warrant`` is the original document *including its own signature*, so the
+    outer signature commits to the inner one and the inner one can still be
+    lifted out and verified on its own. Canonicalization strips only the
+    top-level ``signature`` (see ``app.warrant.canonical_bytes``), which is what
+    makes that chain hold. Two signatures, two timestamps, one verifiable chain.
+    """
+
+    version: Literal["dispute/1"] = DISPUTE_VERSION
+    dispute_id: str = Field(default_factory=new_dispute_id)
+    warrant: Warrant
+    outcome: Outcome
+    reconciliation: Reconciliation
+    issued_at: UtcDatetime = Field(default_factory=utcnow)
+    signature: str | None = None
+
+
 __all__ = [
+    "DISPUTE_ID_PREFIX",
+    "DISPUTE_VERSION",
     "WARRANT_VERSION",
     "WARRANT_ID_PREFIX",
     "Authorization",
     "Breach",
     "BreachCode",
+    "BreachProvenance",
     "ContentHash",
     "CurrencyStr",
+    "DisputePacket",
     "Merchant",
     "MoneyStr",
     "Outcome",
@@ -339,6 +396,7 @@ __all__ = [
     "Verdict",
     "Verification",
     "Warrant",
+    "new_dispute_id",
     "new_warrant_id",
     "rfc3339z",
     "utcnow",

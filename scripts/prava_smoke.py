@@ -31,6 +31,13 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO_ROOT / ".env")
+except ImportError:
+    pass
+
 from app.services.prava_client import (  # noqa: E402
     PravaClient,
     PravaError,
@@ -41,21 +48,30 @@ from app.services.prava_client import (  # noqa: E402
 
 STATE_PATH = REPO_ROOT / ".prava_smoke_state.json"
 
-MERCHANT_NAME = "Northstar Supply"
-MERCHANT_URL = "https://breach.localhost"
-TOTAL_AMOUNT = "84.00"
-OVER_CAP_AMOUNT = "1008.00"
-CURRENCY = "USD"
+# Defaults mirror the Create Session CURL example in docs.prava.space so a
+# support engineer comparing our body to theirs sees the same shape.
+MERCHANT_NAME = os.environ.get("SMOKE_MERCHANT_NAME", "Acme Store")
+# Forwarded to Visa as merchant of record. Must be https. Prefer a plain
+# storefront-shaped URL over github.com / *.localhost — session-create only
+# checks the scheme, but the Visa passkey leg may reject non-merchant hosts.
+MERCHANT_URL = os.environ.get("SMOKE_MERCHANT_URL", "https://acme.example.com")
+TOTAL_AMOUNT = os.environ.get("SMOKE_AMOUNT", "49.99")
+OVER_CAP_AMOUNT = os.environ.get("SMOKE_OVER_CAP_AMOUNT", "1008.00")
+CURRENCY = os.environ.get("SMOKE_CURRENCY", "USD")
+CALLBACK_URL = os.environ.get("SMOKE_CALLBACK_URL", "https://acme.example.com/return")
+
+# Stable, NOT random per run. Prava keys the customer — and therefore the saved
+# cards and the per-browser passkey — off user_id. A fresh uuid each run makes
+# every session a first-time customer, which forces card entry + OTP + passkey
+# *registration* every time and makes the returning-customer path (passkey
+# *verification* against an enrolled card, no OTP) unreachable. Override only to
+# deliberately start over as a new customer.
+SMOKE_USER_ID = os.environ.get("SMOKE_USER_ID", "user_123")
+SMOKE_USER_EMAIL = os.environ.get("SMOKE_USER_EMAIL", "jane@example.com")
 
 
 def load_env() -> str:
-    """Load .env and return the secret key. Never prints the key itself."""
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv(REPO_ROOT / ".env")
-    except ImportError:
-        pass
+    """Return the secret key. Never prints the key itself."""
     key = os.environ.get("PRAVA_SECRET_KEY", "")
     if not key:
         sys.exit("PRAVA_SECRET_KEY is not set. Copy .env into the repo root.")
@@ -127,14 +143,17 @@ async def phase_create() -> int:
 
         step("2", f"POST /v1/sessions — mandate_setup, ${TOTAL_AMOUNT} {CURRENCY}")
         session = await prava.create_mandate_session(
-            user_id=f"warrant_smoke_{uuid.uuid4().hex[:8]}",
-            user_email="smoke@warrant.test",
+            user_id=SMOKE_USER_ID,
+            user_email=SMOKE_USER_EMAIL,
             total_amount=TOTAL_AMOUNT,
             merchant_name=MERCHANT_NAME,
             merchant_url=MERCHANT_URL,
-            description="Northstar Supply — smoke test line item",
-            quantity=1,
+            description="Widget",
+            unit_price="24.99",
+            quantity=2,
             currency=CURRENCY,
+            integration_type="full_checkout",
+            callback_url=CALLBACK_URL,
         )
         show("session (redacted)", session)
 
@@ -199,22 +218,39 @@ async def poll_until_active(
 async def discover_mandate_id(prava: PravaClient, session_id: str) -> str:
     """Find the mandate id, which POST /v1/sessions does not return.
 
-    The docs imply the session response identifies the mandate; the live
-    sandbox returns only ``session_id``, ``order_id``, ``iframe_url``,
-    ``session_token`` and ``expires_at``. The mandate appears to be minted at
-    approval time, so the id has to be read back from the session's
-    payment-result once a human has approved.
+    Live sandbox (2026-08-02): payment-result after a successful mandate-setup
+    approval stays at ``status: "processing"`` / txn ``authorized`` and never
+    carries a ``mandate_id``. The mandate is readable from ``GET /v1/mandates``
+    once passkey approval lands — look for ``externalUserId`` matching the
+    smoke user and ``status: "active"``.
     """
     result = await prava.get_payment_result(session_id)
     show("payment-result (redacted)", result)
     mandate_id = find_first(result, "mandate_id", "mandateId")
-    if not mandate_id:
+    if mandate_id:
+        print(f"\n  discovered mandate_id  {mandate_id} (from payment-result)")
+        return mandate_id
+
+    listed = await prava._request("GET", "/v1/mandates")
+    show("mandates list (redacted)", listed)
+    candidates = [
+        m
+        for m in (listed.get("mandates") or [])
+        if isinstance(m, dict)
+        and str(m.get("externalUserId") or "") == SMOKE_USER_ID
+        and str(m.get("status") or "").lower() == "active"
+    ]
+    if not candidates:
         raise SystemExit(
-            "No mandate id on the session's payment-result yet.\n"
+            "No active mandate for this user yet.\n"
             f"  session status: {result.get('status')!r}\n"
-            "  If that is still 'pending', the passkey approval has not landed."
+            f"  user_id: {SMOKE_USER_ID!r}\n"
+            "  If the session is still pending, the passkey approval has not landed."
         )
-    print(f"\n  discovered mandate_id  {mandate_id}")
+    # Prefer the newest active mandate for this user.
+    candidates.sort(key=lambda m: str(m.get("createdAt") or ""), reverse=True)
+    mandate_id = candidates[0]["id"]
+    print(f"\n  discovered mandate_id  {mandate_id} (from GET /v1/mandates)")
     return mandate_id
 
 
@@ -242,7 +278,9 @@ async def phase_resume() -> int:
         step("6", f"POST /v1/mandates/{{id}}/charge — {TOTAL_AMOUNT}")
         reference = f"warrant-smoke-{uuid.uuid4().hex[:12]}"
         print(f"  reference    {reference}")
-        charge = await prava.charge_mandate(mandate_id, TOTAL_AMOUNT, reference=reference)
+        charge = await prava.charge_mandate(
+            mandate_id, TOTAL_AMOUNT, reference=reference
+        )
         show("charge (redacted)", charge)
 
         creds = charge.get("credentials") or {}
@@ -272,7 +310,10 @@ async def phase_resume() -> int:
 
         over_cap: dict[str, Any] = {}
         if has_token and has_cvv:
-            step("8", f"BONUS — over-cap charge {OVER_CAP_AMOUNT} against a ${TOTAL_AMOUNT} mandate")
+            step(
+                "8",
+                f"BONUS — over-cap charge {OVER_CAP_AMOUNT} against a ${TOTAL_AMOUNT} mandate",
+            )
             print("  a decline here is the expected result, not a failure")
             try:
                 result = await prava.charge_mandate(
@@ -289,7 +330,11 @@ async def phase_resume() -> int:
                 over_cap = {"outcome": "THRESHOLD_EXCEEDED", "detail": str(exc)}
             except PravaError as exc:
                 print(f"\n  declined with a different error: {exc}")
-                over_cap = {"outcome": type(exc).__name__, "code": exc.code, "detail": str(exc)}
+                over_cap = {
+                    "outcome": type(exc).__name__,
+                    "code": exc.code,
+                    "detail": str(exc),
+                }
             save_state(over_cap_charge=over_cap)
 
         print("\n  Record the observed shapes in docs/PRAVA_NOTES.md.")
