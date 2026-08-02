@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Northstar Supply Demo Store</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root { --ink:#10151C; --paper:#F2F4F3; --steel:#5C6B7A; --green:#28705F; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:'IBM Plex Sans', system-ui, sans-serif; color:var(--ink); background:var(--paper); }
+    .demo-banner { background:var(--ink); color:var(--paper); text-align:center; padding:10px 16px; font-weight:700; letter-spacing:.02em; }
+    header { padding:28px 7vw; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(92,107,122,.25); }
+    .brand { font-size:28px; font-weight:700; }
+    .tag { color:var(--steel); font-weight:600; }
+    main { max-width:1120px; margin:42px auto; padding:0 24px; display:grid; grid-template-columns:1fr 1fr; gap:34px; }
+    .hero { min-height:430px; border-radius:24px; background:radial-gradient(circle at 25% 25%, #ffffff 0 18%, transparent 19%), linear-gradient(140deg,#e7ecea,#cdd5d1); box-shadow:0 24px 60px rgba(16,21,28,.13); display:grid; place-items:center; }
+    .crate { width:68%; padding:42px; border-radius:20px; background:#fff; border:1px solid rgba(92,107,122,.3); box-shadow:0 16px 35px rgba(16,21,28,.10); text-align:center; font:700 44px 'IBM Plex Mono', monospace; color:var(--steel); }
+    .panel { background:#fff; border:1px solid rgba(92,107,122,.28); border-radius:24px; padding:30px; box-shadow:0 18px 45px rgba(16,21,28,.08); }
+    h1 { margin:0 0 12px; font-size:42px; line-height:1.05; }
+    p { color:#303842; line-height:1.55; }
+    .price { font:700 28px 'IBM Plex Mono', monospace; margin:18px 0; }
+    .spec { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:20px 0; }
+    .spec div { border:1px solid rgba(92,107,122,.22); border-radius:14px; padding:13px; background:#fafbfb; }
+    .spec span { display:block; color:var(--steel); font-size:13px; }
+    .spec strong { font-family:'IBM Plex Mono', monospace; }
+    label { display:block; font-weight:700; margin-top:14px; }
+    input { width:100%; margin-top:6px; padding:12px 13px; border:1px solid rgba(92,107,122,.45); border-radius:12px; font:inherit; }
+    button { width:100%; margin-top:22px; border:0; border-radius:14px; padding:15px 18px; background:var(--green); color:#fff; font-weight:800; font-size:16px; cursor:pointer; }
+    .small { color:var(--steel); font-size:14px; }
+  </style>
+</head>
+<body>
+  <div class="demo-banner">DEMONSTRATION STOREFRONT operated by the WARRANT project — no real purchases or payments.</div>
+  <header><div class="brand">Northstar Supply</div><div class="tag">Clean commercial catalogue</div></header>
+  <main>
+    <section class="hero" aria-label="Product photo placeholder"><div class="crate">NS<br>CLIPS</div></section>
+    <section class="panel">
+      <p class="small">SKU {{ product.sku }}</p>
+      <h1>{{ product.name }}</h1>
+      <p>Reusable field clips for organizing boxed inventory, bundled cables, and temporary labels. Ships in a compact recycled-paper pouch.</p>
+      <div class="price">${{ '%.2f'|format(product.price) }}</div>
+      <div class="spec">
+        <div><span>Agent authorization</span><strong>1 unit</strong></div>
+        <div><span>Amount cap</span><strong>$84.00</strong></div>
+        <div><span>Configured receipt quantity</span><strong>{{ breach_quantity }}</strong></div>
+        <div><span>Configured receipt amount</span><strong>${{ breach_amount }}</strong></div>
+      </div>
+      <form action="/checkout" method="post">
+        <label>Name<input name="name" autocomplete="name" required></label>
+        <label>Email<input name="email" type="email" autocomplete="email" required></label>
+        <label>Card number <span class="small">demo only</span><input name="card_number" inputmode="numeric" placeholder="4242 4242 4242 4242" required></label>
+        <input type="hidden" name="authorized_quantity" value="1">
+        <button type="submit">Authorize 1 unit for $84.00</button>
+      </form>
+      <p class="small">Set <code>BREACH_QUANTITY=1</code> for an honest receipt, or leave the default <code>12</code> for the reconciliation breach. Current fulfillment status: <code>{{ breach_status }}</code>.</p>
+    </section>
+  </main>
+</body>
+</html>
